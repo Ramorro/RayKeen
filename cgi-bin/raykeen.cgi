@@ -107,6 +107,9 @@ toast_msg() {
     t_cancel) echo "Тестирование остановлено." ;;
     t_err) echo "Ошибка запуска теста." ;;
     low_ram) echo "Внимание: свободной RAM меньше 50 МБ." ;;
+    doh_saved) echo "DoH настройки сохранены." ;;
+    doh_checked_ok) echo "DoH URL доступен." ;;
+    doh_checked_err) echo "DoH URL недоступен." ;;
     dup) echo "$(get_param msg)" ;;
     *) echo "" ;;
   esac
@@ -296,6 +299,33 @@ HTML
   layout_bottom "$toast"
 }
 
+render_settings() {
+  token="$1"
+  csrf=$(get_session_csrf "$token")
+  de=$(sqlite3 "$DB_PATH" "SELECT COALESCE(value,'0') FROM settings WHERE key='doh_enabled' LIMIT 1;")
+  order=$(sqlite3 "$DB_PATH" "SELECT COALESCE(value,'') FROM settings WHERE key='doh_servers_order' LIMIT 1;")
+  custom=$(sqlite3 "$DB_PATH" "SELECT COALESCE(value,'') FROM settings WHERE key='doh_custom_url' LIMIT 1;")
+  timeout=$(sqlite3 "$DB_PATH" "SELECT COALESCE(value,'3') FROM settings WHERE key='doh_fallback_timeout_sec' LIMIT 1;")
+  fakedns=$(sqlite3 "$DB_PATH" "SELECT COALESCE(value,'0') FROM settings WHERE key='doh_fakedns' LIMIT 1;")
+  toast=$(toast_msg "$(get_param toast)")
+  html_header
+  layout_top "RayKeen — Settings"
+  cat <<HTML
+<div class="card"><h2>Settings / DoH</h2>
+<form method="post" action="/raykeen/settings/doh-save" class="row">
+<input type="hidden" name="csrf_token" value="$csrf">
+<label><input type="checkbox" name="doh_enabled" value="1" $( [ "$de" = "1" ] && echo checked )> Включить DoH</label>
+<input type="text" name="doh_servers_order" value="$order" style="min-width:650px" placeholder="Серверы DoH через запятую">
+<input type="text" name="doh_custom_url" value="$custom" placeholder="Кастомный DoH URL">
+<input type="number" name="doh_fallback_timeout_sec" value="$timeout" min="1" max="30" placeholder="Timeout сек">
+<label><input type="checkbox" name="doh_fakedns" value="1" $( [ "$fakedns" = "1" ] && echo checked )> fakeDNS</label>
+<button type="submit">Сохранить и применить</button></form>
+<form method="post" action="/raykeen/settings/doh-check" class="row"><input type="hidden" name="csrf_token" value="$csrf"><input type="text" name="url" value="$custom" placeholder="URL для проверки"><button class="btn-gray" type="submit">Проверить доступность</button></form>
+</div>
+HTML
+  layout_bottom "$toast"
+}
+
 path="${PATH_INFO:-/}"; method="${REQUEST_METHOD:-GET}"; pass_hash=$(get_password_hash)
 
 case "$path" in
@@ -319,8 +349,32 @@ case "$path" in
     post=$(read_post_data); newp=$(param_from_kv password "$post"); [ -n "$newp" ] || { redirect "/raykeen/"; exit 0; }
     set_password_hash "$(hash_password "$newp")"; invalidate_all_sessions; token=$(create_session)
     redirect "/raykeen/dashboard" "raykeen_session=$token; Path=/; HttpOnly; SameSite=Strict" ;;
-  "/dashboard"|"/settings")
+  "/dashboard")
     require_auth || exit 0; render_dashboard ;;
+  "/settings")
+    require_auth || exit 0; render_settings "$AUTH_TOKEN" ;;
+  "/settings/doh-save")
+    [ "$method" = "POST" ] || { redirect "/raykeen/settings"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/settings?toast=csrf"; exit 0; }
+    de=$(param_from_kv doh_enabled "$post"); [ "$de" = "1" ] || de=0
+    order=$(param_from_kv doh_servers_order "$post")
+    custom=$(param_from_kv doh_custom_url "$post")
+    tmo=$(param_from_kv doh_fallback_timeout_sec "$post"); [ -n "$tmo" ] || tmo=3
+    fd=$(param_from_kv doh_fakedns "$post"); [ "$fd" = "1" ] || fd=0
+    sqlite3 "$DB_PATH" "INSERT INTO settings(key,value) VALUES('doh_enabled','$de') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+    sqlite3 "$DB_PATH" "INSERT INTO settings(key,value) VALUES('doh_servers_order','$(printf "%s" "$order" | sed "s/'/''/g")') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+    sqlite3 "$DB_PATH" "INSERT INTO settings(key,value) VALUES('doh_custom_url','$(printf "%s" "$custom" | sed "s/'/''/g")') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+    sqlite3 "$DB_PATH" "INSERT INTO settings(key,value) VALUES('doh_fallback_timeout_sec','$(printf "%s" "$tmo" | tr -cd '0-9')') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+    sqlite3 "$DB_PATH" "INSERT INTO settings(key,value) VALUES('doh_fakedns','$fd') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+    apply_xray_config >/dev/null 2>&1 || true
+    redirect "/raykeen/settings?toast=doh_saved" ;;
+  "/settings/doh-check")
+    [ "$method" = "POST" ] || { redirect "/raykeen/settings"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/settings?toast=csrf"; exit 0; }
+    u=$(param_from_kv url "$post")
+    if check_doh_server "$u"; then redirect "/raykeen/settings?toast=doh_checked_ok"; else redirect "/raykeen/settings?toast=doh_checked_err"; fi ;;
   "/change-password")
     [ "$method" = "POST" ] || { redirect "/raykeen/dashboard"; exit 0; }
     require_auth || exit 0
