@@ -10,6 +10,7 @@ DB_PATH="/opt/etc/raykeen/data/raykeen.db"
 . "$BASE_DIR/lib/profiles.sh"
 . "$BASE_DIR/lib/subscriptions.sh"
 . "$BASE_DIR/lib/xray.sh"
+. "$BASE_DIR/lib/tests.sh"
 
 trap 'log_msg INFO "Получен SIGTERM, завершение CGI"; exit 0' TERM
 
@@ -101,6 +102,9 @@ toast_msg() {
     x_ok) echo "Команда xray выполнена." ;;
     x_err) echo "Ошибка управления xray." ;;
     p_active) echo "Активный профиль обновлён." ;;
+    t_started) echo "Тестирование запущено." ;;
+    t_cancel) echo "Тестирование остановлено." ;;
+    t_err) echo "Ошибка запуска теста." ;;
     dup) echo "$(get_param msg)" ;;
     *) echo "" ;;
   esac
@@ -208,11 +212,20 @@ render_profiles() {
 <textarea name="uri" rows="3" style="width:100%" placeholder="vless://..., vmess://..., ss://..., trojan://..." required></textarea>
 <button type="submit">Добавить</button></form>
 </div>
+<div class="card"><h3>Тестирование профилей</h3>
+<form method="post" action="/raykeen/profiles/test-method" class="row">
+<input type="hidden" name="csrf_token" value="$csrf">
+<select name="method"><option value="http204">HTTP 204</option><option value="tcp">TCP connect</option><option value="icmp">ICMP ping</option></select>
+<button type="submit">Выбрать метод</button></form>
+<form method="post" action="/raykeen/profiles/test-cancel" class="row"><input type="hidden" name="csrf_token" value="$csrf"><button class="btn-red" type="submit">Отменить текущий тест</button></form>
+<p>Прогресс: $(read_progress | awk -F'|' '{print $1" из "$2}') | Статус очереди: $(is_test_running && echo "выполняется" || echo "нет")</p>
+</div>
 <div class="card"><h3>Список</h3>
 <form method="post" action="/raykeen/profiles/bulk" class="row">
 <input type="hidden" name="csrf_token" value="$csrf">
 <input type="text" name="ids" placeholder="ID через запятую (например 1,2,3)">
 <button class="btn-red" name="action" value="delete" type="submit">Удалить</button>
+<button class="btn-gray" name="action" value="test" type="submit">Тестировать</button>
 <button class="btn-gray" name="action" value="export" type="submit">Экспортировать URI</button>
 </form>
 <table class="table"><tr><th>ID</th><th>Статус</th><th>Имя</th><th>Протокол</th><th>Адрес</th><th>Порт</th><th>Enabled</th><th>Actions</th></tr>
@@ -223,6 +236,7 @@ HTML
     clean_lat=$(printf "%s" "$lat" | tr -d '"')
     dot=$(profile_status_dot "$clean_lat")
     printf '<tr><td class="mono">%s</td><td class="status">%s</td><td>%s<br><small>%sms</small></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>' "$id" "$dot" "$clean_name" "${clean_lat:-n/a}" "$proto" "$clean_addr" "$port" "$en"
+    printf '<form style="display:inline" method="post" action="/raykeen/profiles/test-one"><input type="hidden" name="csrf_token" value="%s"><input type="hidden" name="id" value="%s"><button class="btn-gray" type="submit">Тест</button></form> ' "$csrf" "$id"
     printf '<form style="display:inline" method="post" action="/raykeen/profiles/toggle"><input type="hidden" name="csrf_token" value="%s"><input type="hidden" name="id" value="%s"><button class="btn-gray" type="submit">On/Off</button></form> ' "$csrf" "$id"
     printf '<form style="display:inline" method="post" action="/raykeen/profiles/activate"><input type="hidden" name="csrf_token" value="%s"><input type="hidden" name="id" value="%s"><button class="btn-gray" type="submit">Сделать активным</button></form> ' "$csrf" "$id"
     printf '<form style="display:inline" method="post" action="/raykeen/profiles/copy"><input type="hidden" name="csrf_token" value="%s"><input type="hidden" name="id" value="%s"><button class="btn-gray" type="submit">Копия</button></form>' "$csrf" "$id"
@@ -318,6 +332,24 @@ case "$path" in
         redirect "/raykeen/profiles?toast=p_invalid"
       fi
     fi ;;
+  "/profiles/test-method")
+    [ "$method" = "POST" ] || { redirect "/raykeen/profiles"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/profiles?toast=csrf"; exit 0; }
+    tm=$(param_from_kv method "$post"); set_test_method "$tm"
+    redirect "/raykeen/profiles" ;;
+  "/profiles/test-one")
+    [ "$method" = "POST" ] || { redirect "/raykeen/profiles"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/profiles?toast=csrf"; exit 0; }
+    id=$(param_from_kv id "$post"); tm=$(get_test_method)
+    if run_tests_sequential_bg "$id" "$tm" 5; then redirect "/raykeen/profiles?toast=t_started"; else redirect "/raykeen/profiles?toast=t_err"; fi ;;
+  "/profiles/test-cancel")
+    [ "$method" = "POST" ] || { redirect "/raykeen/profiles"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/profiles?toast=csrf"; exit 0; }
+    cancel_tests
+    redirect "/raykeen/profiles?toast=t_cancel" ;;
   "/profiles/toggle")
     [ "$method" = "POST" ] || { redirect "/raykeen/profiles"; exit 0; }
     require_auth || exit 0
@@ -337,6 +369,9 @@ case "$path" in
     ids=$(param_from_kv ids "$post"); action=$(param_from_kv action "$post")
     if [ "$action" = "delete" ]; then
       delete_profiles_by_ids "$ids"; redirect "/raykeen/profiles?toast=p_deleted"
+    elif [ "$action" = "test" ]; then
+      tm=$(get_test_method)
+      if run_tests_sequential_bg "$ids" "$tm" 5; then redirect "/raykeen/profiles?toast=t_started"; else redirect "/raykeen/profiles?toast=t_err"; fi
     elif [ "$action" = "export" ]; then
       printf 'Content-Type: text/plain; charset=UTF-8\r\nContent-Disposition: attachment; filename="profiles.txt"\r\n\r\n'
       export_profiles_raw_uri "$ids"
