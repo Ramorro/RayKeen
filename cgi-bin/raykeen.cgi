@@ -9,6 +9,7 @@ DB_PATH="/opt/etc/raykeen/data/raykeen.db"
 . "$BASE_DIR/lib/auth.sh"
 . "$BASE_DIR/lib/profiles.sh"
 . "$BASE_DIR/lib/subscriptions.sh"
+. "$BASE_DIR/lib/xray.sh"
 
 trap 'log_msg INFO "Получен SIGTERM, завершение CGI"; exit 0' TERM
 
@@ -97,6 +98,9 @@ toast_msg() {
     s_updated) echo "Подписка обновлена." ;;
     s_toggled) echo "Статус подписки изменён." ;;
     s_error) echo "Ошибка обновления подписки." ;;
+    x_ok) echo "Команда xray выполнена." ;;
+    x_err) echo "Ошибка управления xray." ;;
+    p_active) echo "Активный профиль обновлён." ;;
     dup) echo "$(get_param msg)" ;;
     *) echo "" ;;
   esac
@@ -156,8 +160,14 @@ HTML
 render_dashboard() {
   html_header
   layout_top "RayKeen — Dashboard"
+  st=$(xray_status)
+  ver=$(xray_version)
+  active=$(sqlite3 "$DB_PATH" "SELECT COALESCE(name,'(нет)') FROM profiles WHERE active=1 LIMIT 1;")
+  logs=$(xray_log_tail 30 | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
   cat <<HTML
-<div class="card"><h2>Dashboard</h2><p>Фаза 2: управление профилями добавлено.</p><p>Обновление только вручную или при открытии страницы.</p></div>
+<div class="card"><h2>Dashboard</h2><p>Статус xray: <b>$st</b></p><p>Версия xray: <b>$ver</b></p><p>Активный профиль: <b>${active:-нет}</b></p>
+<div class="row"><a href="/raykeen/xray/start"><button>Запустить</button></a><a href="/raykeen/xray/stop"><button class="btn-gray">Остановить</button></a><a href="/raykeen/xray/restart"><button class="btn-gray">Перезапустить</button></a></div></div>
+<div class="card"><h3>Лог xray (последние 30 строк)</h3><pre style="white-space:pre-wrap">$logs</pre></div>
 HTML
   layout_bottom "$(toast_msg "$(get_param toast)")"
 }
@@ -214,6 +224,7 @@ HTML
     dot=$(profile_status_dot "$clean_lat")
     printf '<tr><td class="mono">%s</td><td class="status">%s</td><td>%s<br><small>%sms</small></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>' "$id" "$dot" "$clean_name" "${clean_lat:-n/a}" "$proto" "$clean_addr" "$port" "$en"
     printf '<form style="display:inline" method="post" action="/raykeen/profiles/toggle"><input type="hidden" name="csrf_token" value="%s"><input type="hidden" name="id" value="%s"><button class="btn-gray" type="submit">On/Off</button></form> ' "$csrf" "$id"
+    printf '<form style="display:inline" method="post" action="/raykeen/profiles/activate"><input type="hidden" name="csrf_token" value="%s"><input type="hidden" name="id" value="%s"><button class="btn-gray" type="submit">Сделать активным</button></form> ' "$csrf" "$id"
     printf '<form style="display:inline" method="post" action="/raykeen/profiles/copy"><input type="hidden" name="csrf_token" value="%s"><input type="hidden" name="id" value="%s"><button class="btn-gray" type="submit">Копия</button></form>' "$csrf" "$id"
     printf '</td></tr>'
   done
@@ -332,6 +343,21 @@ case "$path" in
     else
       redirect "/raykeen/profiles"
     fi ;;
+  "/profiles/activate")
+    [ "$method" = "POST" ] || { redirect "/raykeen/profiles"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/profiles?toast=csrf"; exit 0; }
+    id=$(param_from_kv id "$post"); set_active_profile "$id"; apply_xray_config >/dev/null 2>&1 || true
+    redirect "/raykeen/profiles?toast=p_active" ;;
+  "/xray/start")
+    require_auth || exit 0
+    if xray_start; then redirect "/raykeen/dashboard?toast=x_ok"; else redirect "/raykeen/dashboard?toast=x_err"; fi ;;
+  "/xray/stop")
+    require_auth || exit 0
+    if xray_stop; then redirect "/raykeen/dashboard?toast=x_ok"; else redirect "/raykeen/dashboard?toast=x_err"; fi ;;
+  "/xray/restart")
+    require_auth || exit 0
+    if xray_restart; then redirect "/raykeen/dashboard?toast=x_ok"; else redirect "/raykeen/dashboard?toast=x_err"; fi ;;
   "/subscriptions")
     require_auth || exit 0; render_subscriptions "$AUTH_TOKEN" ;;
   "/subscriptions/add")
