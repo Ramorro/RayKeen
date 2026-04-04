@@ -24,6 +24,56 @@ insert_event() {
 active_profile_row() { sqlite3 "$DB_PATH" "SELECT id,protocol,name,address,port,uuid_password FROM profiles WHERE active=1 AND enabled=1 LIMIT 1;"; }
 set_active_profile() { id=$(printf "%s" "$1" | tr -cd '0-9'); sqlite3 "$DB_PATH" "UPDATE profiles SET active=0; UPDATE profiles SET active=1 WHERE id=$id;"; sqlite3 "$DB_PATH" "UPDATE profiles SET use_count=use_count+1 WHERE id=$id;"; }
 
+
+
+build_routing_rules_json() {
+  ids=$(sqlite3 "$DB_PATH" "SELECT id,outbound,COALESCE(profile_id,''),enabled FROM routing_columns ORDER BY "order" ASC;")
+  out=""
+  oldIFS=$IFS; IFS='
+'
+  for row in $ids; do
+    cid=$(printf "%s" "$row" | cut -d'|' -f1)
+    outb=$(printf "%s" "$row" | cut -d'|' -f2)
+    pid=$(printf "%s" "$row" | cut -d'|' -f3)
+    en=$(printf "%s" "$row" | cut -d'|' -f4)
+    [ "$en" = "1" ] || continue
+    tag="$outb"
+    [ "$outb" = "proxy" ] && [ -n "$pid" ] && tag="proxy_${pid}"
+    rr=$(sqlite3 -csv "$DB_PATH" "SELECT type,value FROM routing_rules WHERE column_id=$cid AND enabled=1 ORDER BY "order" ASC;")
+    [ -n "$rr" ] || continue
+    domains=""; ips=""
+    while IFS=',' read -r t v; do
+      val=$(printf "%s" "$v" | sed 's/^"//;s/"$//;s/"/\"/g')
+      if [ "$t" = "domain" ]; then [ -z "$domains" ] && domains=""$val"" || domains="$domains,"$val""; else [ -z "$ips" ] && ips=""$val"" || ips="$ips,"$val""; fi
+    done <<EOF2
+$rr
+EOF2
+    rule='{"type":"field","outboundTag":"'"$tag"'"'
+    [ -n "$domains" ] && rule="$rule,"domain":[${domains}]"
+    [ -n "$ips" ] && rule="$rule,"ip":[${ips}]"
+    rule="$rule}"
+    [ -z "$out" ] && out="$rule" || out="$out,$rule"
+  done
+  IFS=$oldIFS
+  echo "$out"
+}
+
+build_proxy_outbounds_json() {
+  out=""
+  pids=$(sqlite3 "$DB_PATH" "SELECT DISTINCT profile_id FROM routing_columns WHERE enabled=1 AND outbound='proxy' AND profile_id IS NOT NULL ORDER BY profile_id ASC;")
+  for pid in $pids; do
+    row=$(sqlite3 "$DB_PATH" "SELECT protocol,address,port,uuid_password FROM profiles WHERE id=$pid LIMIT 1;")
+    [ -n "$row" ] || continue
+    proto=$(printf "%s" "$row" | cut -d'|' -f1)
+    addr=$(printf "%s" "$row" | cut -d'|' -f2)
+    port=$(printf "%s" "$row" | cut -d'|' -f3)
+    secret=$(printf "%s" "$row" | cut -d'|' -f4)
+    item='{"tag":"proxy_'"$pid"'","protocol":"'"$proto"'","settings":{"vnext":[{"address":"'"$addr"'","port":'"${port:-443}"',"users":[{"id":"'"$secret"'"}]}]}}'
+    [ -z "$out" ] && out="$item" || out="$out,$item"
+  done
+  echo "$out"
+}
+
 compose_doh_servers_json() {
   enabled=$(get_setting_x doh_enabled 0)
   [ "$enabled" = "1" ] || { echo ""; return; }
@@ -58,6 +108,8 @@ generate_xray_config_tmp() {
   [ "$bind" = "all" ] && bind="0.0.0.0"
 
   dns_extra=$(compose_doh_servers_json)
+  route_rules=$(build_routing_rules_json)
+  extra_outbounds=$(build_proxy_outbounds_json)
   fake_dns=$(get_setting_x doh_fakedns 0)
   [ "$fake_dns" = "1" ] && fake_line=',"fakedns":[{"ipPool":"198.18.0.0/15","poolSize":65535}]' || fake_line=''
 
@@ -69,9 +121,9 @@ generate_xray_config_tmp() {
   "outbounds": [
     {"tag": "proxy","protocol": "$proto","settings": {"vnext": [{"address":"$addr","port": ${port:-443},"users":[{"id":"$secret"}]}]}},
     {"tag":"direct","protocol":"freedom"},
-    {"tag":"block","protocol":"blackhole"}
+    {"tag":"block","protocol":"blackhole"}${extra_outbounds:+,${extra_outbounds}}
   ],
-  "routing": {"rules":[{"type":"field","outboundTag":"proxy","network":"tcp,udp"}]},
+  "routing": {"rules":[{"type":"field","outboundTag":"proxy","network":"tcp,udp"}${route_rules:+,${route_rules}}]},
   "stats": {},
   "api": {"tag":"api","services":["StatsService"]}
   ${dns_extra:+,${dns_extra}}

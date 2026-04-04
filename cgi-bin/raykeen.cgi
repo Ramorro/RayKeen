@@ -12,6 +12,7 @@ DB_PATH="/opt/etc/raykeen/data/raykeen.db"
 . "$BASE_DIR/lib/xray.sh"
 . "$BASE_DIR/lib/tests.sh"
 . "$BASE_DIR/lib/monitor.sh"
+. "$BASE_DIR/lib/routing.sh"
 
 trap 'log_msg INFO "Получен SIGTERM, завершение CGI"; exit 0' TERM
 
@@ -72,7 +73,7 @@ button{background:#2563eb;color:#fff;border:none;cursor:pointer}.btn-red{backgro
 .table{width:100%;border-collapse:collapse}.table td,.table th{border-bottom:1px solid #374151;padding:8px;text-align:left}.mono{font-family:monospace}
 .status{font-size:18px}.toast{position:fixed;right:16px;bottom:16px;background:#374151;padding:12px;border-radius:8px;opacity:.95}
 a{color:#93c5fd;text-decoration:none}
-</style></head><body><div class="wrap"><div class="sidebar"><h3>RayKeen</h3><p><a href="/raykeen/dashboard">Dashboard</a></p><p><a href="/raykeen/profiles">Profiles</a></p><p><a href="/raykeen/subscriptions">Subscriptions</a></p><p><a href="/raykeen/settings">Settings</a></p><p><a href="/raykeen/logout">Выход</a></p></div><div class="main">
+</style></head><body><div class="wrap"><div class="sidebar"><h3>RayKeen</h3><p><a href="/raykeen/dashboard">Dashboard</a></p><p><a href="/raykeen/profiles">Profiles</a></p><p><a href="/raykeen/subscriptions">Subscriptions</a></p><p><a href="/raykeen/routing">Routing</a></p><p><a href="/raykeen/settings">Settings</a></p><p><a href="/raykeen/logout">Выход</a></p></div><div class="main">
 HTML
 }
 
@@ -110,6 +111,8 @@ toast_msg() {
     doh_saved) echo "DoH настройки сохранены." ;;
     doh_checked_ok) echo "DoH URL доступен." ;;
     doh_checked_err) echo "DoH URL недоступен." ;;
+    r_saved) echo "Маршрутизация обновлена." ;;
+    r_err) echo "Ошибка правила маршрутизации." ;;
     dup) echo "$(get_param msg)" ;;
     *) echo "" ;;
   esac
@@ -326,6 +329,36 @@ HTML
   layout_bottom "$toast"
 }
 
+render_routing() {
+  token="$1"
+  csrf=$(get_session_csrf "$token")
+  cols=$(list_columns_csv)
+  toast=$(toast_msg "$(get_param toast)")
+  html_header
+  layout_top "RayKeen — Routing"
+  cat <<HTML
+<div class="card"><h2>Routing</h2><p>Порядок колонок = приоритет правил в xray.</p>
+<form method="post" action="/raykeen/routing/column-add" class="row"><input type="hidden" name="csrf_token" value="$csrf"><input type="text" name="name" placeholder="Название колонки" required><select name="outbound"><option value="direct">Direct</option><option value="block">Block</option><option value="proxy">Proxy</option></select><input type="text" name="profile_id" placeholder="profile_id (для Proxy)"><button type="submit">Добавить колонку</button></form>
+<form method="post" action="/raykeen/routing/preset" class="row"><input type="hidden" name="csrf_token" value="$csrf"><button class="btn-gray" name="preset" value="ru" type="submit">RU-direct</button><button class="btn-gray" name="preset" value="ads" type="submit">ADS-block</button><button class="btn-gray" formaction="/raykeen/routing/export" type="submit">Экспорт JSON</button></form>
+</div>
+HTML
+  echo "$cols" | tail -n +2 | while IFS=',' read -r cid name outb pid ord en created; do
+    n=$(printf "%s" "$name" | sed 's/^"//;s/"$//')
+    echo "<div class="card"><h3>${n} (#${cid})</h3><p>Outbound: ${outb} | profile_id: ${pid} | enabled: ${en}</p>"
+    echo "<form method="post" action="/raykeen/routing/column-move" class="row"><input type="hidden" name="csrf_token" value="$csrf"><input type="hidden" name="id" value="$cid"><button class="btn-gray" name="dir" value="up">Вверх</button><button class="btn-gray" name="dir" value="down">Вниз</button><button class="btn-gray" formaction="/raykeen/routing/column-toggle">On/Off</button></form>"
+    echo "<form method="post" action="/raykeen/routing/rule-add" class="row"><input type="hidden" name="csrf_token" value="$csrf"><input type="hidden" name="column_id" value="$cid"><select name="type"><option value="domain">domain</option><option value="ip">ip</option><option value="cidr">cidr</option></select><input type="text" name="value" placeholder="значение" required><input type="text" name="comment" placeholder="комментарий"><button type="submit">Добавить правило</button></form>"
+    rules=$(list_rules_csv "$cid")
+    echo "<table class="table"><tr><th>ID</th><th>Type</th><th>Value</th><th>Comment</th><th>Enabled</th><th>Action</th></tr>"
+    echo "$rules" | tail -n +2 | while IFS=',' read -r rid rcid t v c ro re; do
+      vv=$(printf "%s" "$v" | sed 's/^"//;s/"$//')
+      cc=$(printf "%s" "$c" | sed 's/^"//;s/"$//')
+      echo "<tr><td>$rid</td><td>$t</td><td>$vv</td><td>$cc</td><td>$re</td><td><form method="post" action="/raykeen/routing/rule-toggle"><input type="hidden" name="csrf_token" value="$csrf"><input type="hidden" name="id" value="$rid"><button class="btn-gray" type="submit">On/Off</button></form></td></tr>"
+    done
+    echo "</table></div>"
+  done
+  layout_bottom "$toast"
+}
+
 path="${PATH_INFO:-/}"; method="${REQUEST_METHOD:-GET}"; pass_hash=$(get_password_hash)
 
 case "$path" in
@@ -486,6 +519,52 @@ case "$path" in
     post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/subscriptions?toast=csrf"; exit 0; }
     update_all_subscriptions_sequential
     redirect "/raykeen/subscriptions?toast=s_updated" ;;
+  "/routing")
+    require_auth || exit 0; render_routing "$AUTH_TOKEN" ;;
+  "/routing/column-add")
+    [ "$method" = "POST" ] || { redirect "/raykeen/routing"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/routing?toast=csrf"; exit 0; }
+    n=$(param_from_kv name "$post"); o=$(param_from_kv outbound "$post"); p=$(param_from_kv profile_id "$post")
+    create_column "$n" "$o" "$p"; apply_xray_config >/dev/null 2>&1 || true
+    redirect "/raykeen/routing?toast=r_saved" ;;
+  "/routing/column-move")
+    [ "$method" = "POST" ] || { redirect "/raykeen/routing"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/routing?toast=csrf"; exit 0; }
+    id=$(param_from_kv id "$post"); d=$(param_from_kv dir "$post"); move_column "$id" "$d"; apply_xray_config >/dev/null 2>&1 || true
+    redirect "/raykeen/routing?toast=r_saved" ;;
+  "/routing/column-toggle")
+    [ "$method" = "POST" ] || { redirect "/raykeen/routing"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/routing?toast=csrf"; exit 0; }
+    id=$(param_from_kv id "$post"); toggle_column "$id"; apply_xray_config >/dev/null 2>&1 || true
+    redirect "/raykeen/routing?toast=r_saved" ;;
+  "/routing/rule-add")
+    [ "$method" = "POST" ] || { redirect "/raykeen/routing"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/routing?toast=csrf"; exit 0; }
+    cid=$(param_from_kv column_id "$post"); t=$(param_from_kv type "$post"); v=$(param_from_kv value "$post"); c=$(param_from_kv comment "$post")
+    if add_rule "$cid" "$t" "$v" "$c" >/dev/null 2>&1; then apply_xray_config >/dev/null 2>&1 || true; redirect "/raykeen/routing?toast=r_saved"; else redirect "/raykeen/routing?toast=r_err"; fi ;;
+  "/routing/rule-toggle")
+    [ "$method" = "POST" ] || { redirect "/raykeen/routing"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/routing?toast=csrf"; exit 0; }
+    id=$(param_from_kv id "$post"); toggle_rule "$id"; apply_xray_config >/dev/null 2>&1 || true
+    redirect "/raykeen/routing?toast=r_saved" ;;
+  "/routing/preset")
+    [ "$method" = "POST" ] || { redirect "/raykeen/routing"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/routing?toast=csrf"; exit 0; }
+    pr=$(param_from_kv preset "$post"); [ "$pr" = "ru" ] && apply_preset_ru_direct || apply_preset_ads_block
+    apply_xray_config >/dev/null 2>&1 || true
+    redirect "/raykeen/routing?toast=r_saved" ;;
+  "/routing/export")
+    [ "$method" = "POST" ] || { redirect "/raykeen/routing"; exit 0; }
+    require_auth || exit 0
+    post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/routing?toast=csrf"; exit 0; }
+    printf 'Content-Type: application/json; charset=UTF-8\r\nContent-Disposition: attachment; filename="routing.json"\r\n\r\n'
+    export_routing_json ;;
   "/health")
     printf "Content-Type: application/json; charset=UTF-8\r\n\r\n"
     render_health_json ;;
