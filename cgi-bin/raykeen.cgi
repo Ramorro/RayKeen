@@ -11,6 +11,7 @@ DB_PATH="/opt/etc/raykeen/data/raykeen.db"
 . "$BASE_DIR/lib/subscriptions.sh"
 . "$BASE_DIR/lib/xray.sh"
 . "$BASE_DIR/lib/tests.sh"
+. "$BASE_DIR/lib/monitor.sh"
 
 trap 'log_msg INFO "Получен SIGTERM, завершение CGI"; exit 0' TERM
 
@@ -105,6 +106,7 @@ toast_msg() {
     t_started) echo "Тестирование запущено." ;;
     t_cancel) echo "Тестирование остановлено." ;;
     t_err) echo "Ошибка запуска теста." ;;
+    low_ram) echo "Внимание: свободной RAM меньше 50 МБ." ;;
     dup) echo "$(get_param msg)" ;;
     *) echo "" ;;
   esac
@@ -168,12 +170,24 @@ render_dashboard() {
   ver=$(xray_version)
   active=$(sqlite3 "$DB_PATH" "SELECT COALESCE(name,'(нет)') FROM profiles WHERE active=1 LIMIT 1;")
   logs=$(xray_log_tail 30 | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
+  cpu=$(cpu_usage_percent)
+  ram=$(ram_free_mb)
+  wan=$(wan_rx_tx_bytes)
+  rx=$(printf "%s" "$wan" | cut -d'|' -f1)
+  tx=$(printf "%s" "$wan" | cut -d'|' -f2)
+  iface=$(printf "%s" "$wan" | cut -d'|' -f3)
+  temp=$(cpu_temp_c)
+  xr_uptime=$(xray_uptime_sec)
+  xr_restarts=$(xray_restarts_last_day)
+  toast=$(toast_msg "$(get_param toast)")
+  [ "$ram" -lt 50 ] && toast="$(toast_msg low_ram)"
   cat <<HTML
 <div class="card"><h2>Dashboard</h2><p>Статус xray: <b>$st</b></p><p>Версия xray: <b>$ver</b></p><p>Активный профиль: <b>${active:-нет}</b></p>
-<div class="row"><a href="/raykeen/xray/start"><button>Запустить</button></a><a href="/raykeen/xray/stop"><button class="btn-gray">Остановить</button></a><a href="/raykeen/xray/restart"><button class="btn-gray">Перезапустить</button></a></div></div>
+<div class="row"><a href="/raykeen/xray/start"><button>Запустить</button></a><a href="/raykeen/xray/stop"><button class="btn-gray">Остановить</button></a><a href="/raykeen/xray/restart"><button class="btn-gray">Перезапустить</button></a><a href="/raykeen/dashboard"><button class="btn-gray">Обновить</button></a></div></div>
+<div class="card"><h3>Мониторинг</h3><p>CPU: <b>${cpu}%</b> | RAM свободно: <b>${ram} MB</b> | WAN($iface) RX/TX: <b>${rx}/${tx} bytes</b> | Temp: <b>${temp}°C</b></p><p>Uptime xray: <b>${xr_uptime} сек</b> | Авторестарты за 24ч: <b>${xr_restarts}</b></p></div>
 <div class="card"><h3>Лог xray (последние 30 строк)</h3><pre style="white-space:pre-wrap">$logs</pre></div>
 HTML
-  layout_bottom "$(toast_msg "$(get_param toast)")"
+  layout_bottom "$toast"
 }
 
 profile_status_dot() {
@@ -418,6 +432,9 @@ case "$path" in
     post=$(read_post_data); require_post_csrf "$post" || { redirect "/raykeen/subscriptions?toast=csrf"; exit 0; }
     update_all_subscriptions_sequential
     redirect "/raykeen/subscriptions?toast=s_updated" ;;
+  "/health")
+    printf "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+    render_health_json ;;
   "/logout")
     token=$(get_cookie_value raykeen_session || true)
     [ -n "$token" ] && rm -f "/tmp/raykeen/sessions/$token" 2>/dev/null || true
